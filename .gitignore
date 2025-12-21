@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+*.log
+
+# Environments
+venv/
+.venv/
+.env
+
+# OS/files
+.DS_Store
+
+# Corpora/indexes (adjust if you want to commit raw texts)
+indexes/
+texts/**/*.tmp
