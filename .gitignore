@@ -20,5 +20,3 @@ venv/
 # Corpora/indexes (adjust if you want to commit raw texts)
 indexes/
 texts/**/*.tmp
-
-.rag/
