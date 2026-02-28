@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/cx [options] "task text"
+
+Options:
+  --question "text"   Retrieval question (defaults to task text)
+  --k N               Top-k RAG chunks (default: 5)
+  --print-prompt      Print RAG-injected prompt and exit
+  --exec              Run via `codex exec` instead of interactive `codex`
+  --full-auto         Pass --full-auto to Codex
+  --codex-arg ARG     Extra Codex arg (repeatable)
+  -h, --help          Show help
+
+Environment:
+  RAG_BASE_URL        RAG server URL (default: http://127.0.0.1:8010)
+  RAG_TOP_K           Default top-k if --k is not provided
+EOF
+}
+
+BASE_URL="${RAG_BASE_URL:-http://127.0.0.1:8010}"
+K="${RAG_TOP_K:-5}"
+PRINT_PROMPT=0
+EXEC_MODE=0
+FULL_AUTO=0
+QUESTION=""
+CODEX_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --question)
+      QUESTION="${2:-}"
+      shift 2
+      ;;
+    --k)
+      K="${2:-}"
+      shift 2
+      ;;
+    --print-prompt)
+      PRINT_PROMPT=1
+      shift
+      ;;
+    --exec)
+      EXEC_MODE=1
+      shift
+      ;;
+    --full-auto)
+      FULL_AUTO=1
+      shift
+      ;;
+    --codex-arg)
+      CODEX_ARGS+=("${2:-}")
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+TASK="$*"
+if [[ -z "$QUESTION" ]]; then
+  QUESTION="$TASK"
+fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_DIR="$REPO_ROOT/.rag/context"
+mkdir -p "$OUT_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+OUT_FILE="$OUT_DIR/query-$STAMP.json"
+
+PAYLOAD="$(python3 - "$QUESTION" "$K" <<'PY'
+import json
+import sys
+
+question = sys.argv[1]
+try:
+    k = int(sys.argv[2])
+except ValueError as exc:
+    raise SystemExit(f"invalid --k value: {sys.argv[2]}") from exc
+
+print(json.dumps({"question": question, "k": k}))
+PY
+)"
+
+RESPONSE="$(curl -fsS "$BASE_URL/rag/query" -H "Content-Type: application/json" -d "$PAYLOAD")"
+printf '%s\n' "$RESPONSE" > "$OUT_FILE"
+
+PROMPT="$(python3 - "$OUT_FILE" "$TASK" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+task = sys.argv[2]
+data = json.loads(path.read_text(encoding="utf-8"))
+context = data.get("context", [])
+
+lines = [
+    "You are working inside the AugustineCorpusGateway codebase.",
+    "",
+    "Relevant context:",
+]
+
+if not context:
+    lines.append("- (No indexed context found.)")
+
+for item in context:
+    file_path = str(item.get("file", "")).strip() or "(unknown)"
+    excerpt = " ".join(str(item.get("excerpt", "")).split())
+    lines.append(f"- file: {file_path}")
+    lines.append(f"  excerpt: {excerpt}")
+
+lines.extend(["", "Task:", task.strip()])
+print("\n".join(lines))
+PY
+)"
+
+if [[ "$PRINT_PROMPT" -eq 1 ]]; then
+  printf '%s\n' "$PROMPT"
+  printf '\ncontext json: %s\n' "$OUT_FILE"
+  exit 0
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "Could not find 'codex' in PATH." >&2
+  echo "Use --print-prompt and paste into VS Code Codex chat instead." >&2
+  echo "Context saved: $OUT_FILE" >&2
+  exit 1
+fi
+
+CMD=(codex)
+if [[ "$EXEC_MODE" -eq 1 ]]; then
+  CMD+=(exec)
+fi
+if [[ "$FULL_AUTO" -eq 1 ]]; then
+  CMD+=(--full-auto)
+fi
+if [[ "${#CODEX_ARGS[@]}" -gt 0 ]]; then
+  CMD+=("${CODEX_ARGS[@]}")
+fi
+CMD+=("$PROMPT")
+
+printf 'Context saved: %s\n' "$OUT_FILE"
+exec "${CMD[@]}"
